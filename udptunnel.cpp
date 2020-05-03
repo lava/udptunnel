@@ -69,6 +69,9 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
   fmt::print("Listening on {}\n", print_addr(&addr));
   std::cout << "asdfasdf\n" << std::flush;
 
+  bool nochdir = true, noclose = true;
+  daemon(nochdir, noclose);
+
   int udp_sockfd = ::socket(AF_INET, SOCK_DGRAM, 0);
   struct sockaddr_in udp_addr;
   udp_addr.sin_family = AF_INET;
@@ -76,15 +79,15 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
   udp_addr.sin_port = htons(connect_port);
 
   struct sockaddr_in tcp_client;
-  while (true) {
-    // Accept only one client at the same time
-    // (if we want to change that, we need to dynamically spawn a new udp
-    // socket per connection)
-    int client = ::accept(tcp_listenfd, NULL, NULL);
-    fmt::print("Received incoming tcp connection\n");
 
-    bev::linear_ringbuffer udp_to_tcp;
-    bev::linear_ringbuffer tcp_to_udp;
+  // Accept only one client at the same time
+  // (if we want to change that, we need to dynamically spawn a new udp
+  // socket per connection)
+  int client = ::accept(tcp_listenfd, NULL, NULL);
+  fmt::print("Received incoming tcp connection\n");
+
+  bev::linear_ringbuffer udp_to_tcp;
+  bev::linear_ringbuffer tcp_to_udp;
 
     fd_set rfds;
     fd_set wfds;
@@ -142,7 +145,7 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
       if (FD_ISSET(client, &rfds)) {
         ssize_t n =
             ::recv(client, tcp_to_udp.write_head(), tcp_to_udp.free_size(), 0);
-        fmt::print("Received incoming udp packet via tcp with {} bytes\n", n);
+        fmt::print("Received incoming tcp packet with {} bytes\n", n);
         std::cout << "\n" << std::flush;
 
         if (n > 0) { // The "normal" path
@@ -160,6 +163,9 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
         char payload[65528]; // max udp packet size
         ssize_t n = ::recvfrom(udp_sockfd, &payload, sizeof(payload), 0,
                                nullptr, nullptr);
+
+        fmt::print("Received incoming udp packet with {} bytes\n", n);
+        std::cout << "\n" << std::flush;
         if (n > 0 && udp_to_tcp.free_size() >=
                          n + 4) { // packet drop if not enough free size
           int32_t n32 = n;
@@ -170,8 +176,8 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
       }
     }
 
-    fmt::printf("dropped connection, awaiting next one;");
-  }
+    fmt::printf("lost tcp connection, terminating;");
+    return 0;
 }
 
 int local_main(const std::string &server, uint16_t remote_port,
@@ -277,12 +283,18 @@ int main(int argc, char *argv[]) {
   // clang-format off
   po::options_description desc("Options");
   desc.add_options()("help", "print help")
-    ("port", po::value<uint16_t>(&remote_port)->required(), "target udp port")
-    ("logfile", po::value<std::string>(&logfile), "log filename")
-    ("server", po::value<std::string>(&server), "remote server")
-    ("server-user", po::value<std::string>(&user), "remote server username")
+    ("port", po::value<uint16_t>(&remote_port)->required(),
+     "target udp port")
+    ("logfile", po::value<std::string>(&logfile),
+     "log filename")
+    ("server", po::value<std::string>(&server),
+     "remote server")
+    ("server-user", po::value<std::string>(&user),
+     "remote server username")
     ("__remote-startup", po::value<uint16_t>(&server_local_port),
       "ignore; not meant for users!");
+    // todo: client-only, dont scp to server
+    // todo: server-only, basically __remote-startup but exposed for users
   // clang-format on
 
   po::variables_map vm;
@@ -311,8 +323,9 @@ int main(int argc, char *argv[]) {
   if (remote) {
     fmt::print("Starting server end of udp tunnel\n");
     std::cout << "foo" << std::endl;
-    std::cerr << "bar" << std::endl;
-    return remote_main(server_local_port, remote_port);
+    int retval = remote_main(server_local_port, remote_port);
+    // ::unlink(argv[0])
+    return retval;
   }
 
   if (!vm.count("server") || !vm.count("server-user")) {
@@ -328,7 +341,7 @@ int main(int argc, char *argv[]) {
   // TODO: Make the server daemonize after listening socket was opened, instead
   // of random sleep
   std::string ssh_cmd = fmt::format("ssh {}@{} -- ./{} --__remote-startup {} "
-                                    "--port {} --logfile udpserver.log &",
+                                    "--port {} --logfile udpserver.log",
                                     user, server, remote_filename,
                                     server_local_port, remote_port);
 
@@ -337,7 +350,7 @@ int main(int argc, char *argv[]) {
   system(scp_cmd.c_str());
   system(ssh_cmd.c_str());
 
-  ::sleep(2); // wait for remote server startup
+  //::sleep(2); // wait for remote server startup
 
   local_main(server, server_local_port, remote_port);
 
