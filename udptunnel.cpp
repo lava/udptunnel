@@ -53,12 +53,21 @@ bool package_complete(const bev::linear_ringbuffer &buf) {
   return buf.size() >= 4 + pktsize;
 }
 
-int remote_main(uint16_t listen_port, uint16_t connect_port) {
+
+//                                       udp packets                                                        tunnel
+//   (internet)                         -------------> [listen_port, udp] (remote) [connect_port, tcp] ----------------> (local)
+//
+//
+//   If forwarding_port > 0:
+//                                       udp packets                                                         tunnel
+//   (server) [forwarding_port, udp]  <----------------                   (remote)                     <----------------- (local)
+//
+int remote_main(uint16_t forwarding_port, uint16_t udp_listenport, uint16_t tcp_listenport, bool accept_remote_udp) {
   int tcp_listenfd = ::socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in addr;
   socklen_t addrlen = sizeof(addr);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(listen_port);
+  addr.sin_port = htons(tcp_listenport);
   addr.sin_family = AF_INET;
   ::bind(tcp_listenfd, reinterpret_cast<struct sockaddr *>(&addr),
          sizeof(addr));
@@ -67,7 +76,6 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
   ::listen(tcp_listenfd, 2);
 
   fmt::print("Listening on {}\n", print_addr(&addr));
-  std::cout << "asdfasdf\n" << std::flush;
 
   bool nochdir = true, noclose = true;
   daemon(nochdir, noclose);
@@ -75,8 +83,10 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
   int udp_sockfd = ::socket(AF_INET, SOCK_DGRAM, 0);
   struct sockaddr_in udp_addr;
   udp_addr.sin_family = AF_INET;
-  udp_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  udp_addr.sin_port = htons(connect_port);
+  udp_addr.sin_addr.s_addr = accept_remote_udp
+    ? htonl(INADDR_ANY)
+    : htonl(INADDR_LOOPBACK);
+  udp_addr.sin_port = htons(udp_listenport);
 
   struct sockaddr_in tcp_client;
 
@@ -89,13 +99,16 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
   bev::linear_ringbuffer udp_to_tcp;
   bev::linear_ringbuffer tcp_to_udp;
 
-    fd_set rfds;
-    fd_set wfds;
-    int nfds = std::max(client, udp_sockfd) + 1;
-    while (true) {
+  fd_set rfds;
+  fd_set wfds;
+  int nfds = std::max(client, udp_sockfd) + 1;
+  while (true) {
       FD_ZERO(&rfds);
       FD_ZERO(&wfds);
-      FD_SET(client, &rfds);
+      // TODO: Drain incoming data from the client and print a warning if we ignore it.
+      if (forwarding_port) {
+        FD_SET(client, &rfds);
+      }
       FD_SET(udp_sockfd, &rfds);
       if (package_complete(tcp_to_udp)) {
         FD_SET(udp_sockfd, &wfds);
@@ -180,21 +193,29 @@ int remote_main(uint16_t listen_port, uint16_t connect_port) {
     return 0;
 }
 
-int local_main(const std::string &server, uint16_t remote_port,
-               uint16_t listen_port) {
-  int udp_sockfd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  struct sockaddr_in addr;
-  socklen_t addrlen = sizeof(addr);
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(listen_port);
-  addr.sin_family = AF_INET;
-  ::bind(udp_sockfd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
-  ::getsockname(udp_sockfd, reinterpret_cast<struct sockaddr *>(&addr),
-                &addrlen);
+//
+// If udp_listenport_local, then data will also be transferred from local
+// to the remote.
+//
+int local_main(const std::string &server, uint16_t tcp_listenport_remote,
+               uint16_t udp_forwardingport_local, uint16_t udp_listenport_local) {
+  int udp_sockfd = -1;
+  if (udp_listenport_local) {
+    ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(udp_listenport_local);
+    addr.sin_family = AF_INET;
+    ::bind(udp_sockfd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
+    ::getsockname(udp_sockfd, reinterpret_cast<struct sockaddr *>(&addr),
+                  &addrlen);
+    fmt::print("Local socket bound to {}\n", print_addr(&addr));
+  }
 
   // Using `getaddrinfo()` with static linking generates a warning,
   // but as long as we use it only in `local_main()` we should be fine.
-  auto ports = std::to_string(remote_port);
+  auto ports = std::to_string(tcp_listenport_remote);
   debug(ports);
   struct addrinfo *res = nullptr;
   struct addrinfo hints = {0};
@@ -213,7 +234,6 @@ int local_main(const std::string &server, uint16_t remote_port,
     return -1;
   }
 
-  fmt::print("Local socket bound to {}\n", print_addr(&addr));
   std::fflush(stdout);
 
   std::vector<char> pktbuffer(8 * 1024 * 1024);
@@ -222,13 +242,17 @@ int local_main(const std::string &server, uint16_t remote_port,
   fd_set wfds;
   int nfds = std::max(udp_sockfd, tcp_sockfd) + 1;
   struct sockaddr_in client;
+  client.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  client.sin_port = htons(udp_forwardingport_local);
   while (true) {
     // todo: switch to poll (although for this use case we're pretty much
     // guaranteed small fds)
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
-    FD_SET(udp_sockfd, &rfds);
     FD_SET(tcp_sockfd, &rfds);
+    if (udp_listenport_local) {
+      FD_SET(udp_sockfd, &rfds);
+    }
     if (::select(nfds, &rfds, nullptr, nullptr, nullptr) < 0) {
       perror("select: ");
       return -1;
@@ -277,23 +301,28 @@ int main(int argc, char *argv[]) {
   std::string server;
   std::string user;
   std::string logfile;
-  uint16_t remote_port;
-  uint16_t server_local_port;
+  uint16_t udp_listenport_remote;
+  uint16_t tcp_listenport_remote;
+  bool replicate;
+  bool accept_external_udp;
 
   // clang-format off
   po::options_description desc("Options");
   desc.add_options()("help", "print help")
-    ("port", po::value<uint16_t>(&remote_port)->required(),
-     "target udp port")
+    ("port", po::value<uint16_t>(&udp_listenport_remote)->required(),
+     "udp port where the remote listens")
     ("logfile", po::value<std::string>(&logfile),
      "log filename")
     ("server", po::value<std::string>(&server),
      "remote server")
     ("server-user", po::value<std::string>(&user),
      "remote server username")
-    ("__remote-startup", po::value<uint16_t>(&server_local_port),
-      "ignore; not meant for users!");
-    // todo: client-only, dont scp to server
+    ("replicate", po::value<bool>(&replicate)->default_value(false),
+     "whether to replicate the server onto the remote machine")
+    ("external", po::value<bool>(&accept_external_udp)->default_value(false),
+     "whether to accept external packets on the server")
+    ("__remote-startup", po::value<uint16_t>(&tcp_listenport_remote)->default_value(45544),
+      "ignore; not meant for users! (listen port of the tcp tunnel)");
     // todo: server-only, basically __remote-startup but exposed for users
   // clang-format on
 
@@ -308,9 +337,6 @@ int main(int argc, char *argv[]) {
   bool remote = false;
   if (vm.count("__remote-startup")) {
     remote = true;
-  } else {
-    // todo: figure out default arguments in boost
-    server_local_port = 44554;
   }
   po::notify(vm);
 
@@ -323,7 +349,8 @@ int main(int argc, char *argv[]) {
   if (remote) {
     fmt::print("Starting server end of udp tunnel\n");
     std::cout << "foo" << std::endl;
-    int retval = remote_main(server_local_port, remote_port);
+    uint16_t forwarding_port = 0;
+    int retval = remote_main(forwarding_port, udp_listenport_remote, tcp_listenport_remote, accept_external_udp);
     // ::unlink(argv[0])
     return retval;
   }
@@ -343,7 +370,7 @@ int main(int argc, char *argv[]) {
   std::string ssh_cmd = fmt::format("ssh {}@{} -- ./{} --__remote-startup {} "
                                     "--port {} --logfile udpserver.log",
                                     user, server, remote_filename,
-                                    server_local_port, remote_port);
+                                    tcp_listenport_remote, udp_listenport_remote);
 
   debug(ssh_cmd);
 
@@ -352,7 +379,9 @@ int main(int argc, char *argv[]) {
 
   //::sleep(2); // wait for remote server startup
 
-  local_main(server, server_local_port, remote_port);
+  local_main(server, tcp_listenport_remote,
+      udp_listenport_remote, // forwarding port
+      0);                    // listen port
 
   std::string clean_cmd =
       fmt::format("ssh {}@{} -- rm {}", user, server, remote_filename);
