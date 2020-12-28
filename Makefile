@@ -3,8 +3,8 @@ BOOST_LIBS := -lboost_program_options -lboost_system
 
 UDPTUNNEL_LIBS = $(FMT_LIBS) $(BOOST_LIBS)
 
-# STATIC_BUILD_FLAGS = -static
-STATIC_BUILD_FLAGS =
+STATIC_BUILD_FLAGS = -static
+# STATIC_BUILD_FLAGS =
 
 BUNDLED_LIBS_FLAGS = -Iaux/linear_ringbuffer/include
 # BUNDLED_LIBS_FLAGS = 

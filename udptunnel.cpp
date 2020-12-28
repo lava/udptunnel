@@ -69,6 +69,10 @@ int remote_main(uint16_t forwarding_port, uint16_t udp_listenport, uint16_t tcp_
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons(tcp_listenport);
   addr.sin_family = AF_INET;
+
+  int yes = 1;
+  ::setsockopt(tcp_listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
+
   ::bind(tcp_listenfd, reinterpret_cast<struct sockaddr *>(&addr),
          sizeof(addr));
   ::getsockname(tcp_listenfd, reinterpret_cast<struct sockaddr *>(&addr),
@@ -87,6 +91,9 @@ int remote_main(uint16_t forwarding_port, uint16_t udp_listenport, uint16_t tcp_
     ? htonl(INADDR_ANY)
     : htonl(INADDR_LOOPBACK);
   udp_addr.sin_port = htons(udp_listenport);
+
+  ::bind(udp_sockfd, reinterpret_cast<struct sockaddr *>(&udp_addr),
+         sizeof(udp_addr));
 
   struct sockaddr_in tcp_client;
 
@@ -321,7 +328,7 @@ int main(int argc, char *argv[]) {
      "whether to replicate the server onto the remote machine")
     ("external", po::value<bool>(&accept_external_udp)->default_value(false),
      "whether to accept external packets on the server")
-    ("__remote-startup", po::value<uint16_t>(&tcp_listenport_remote)->default_value(45544),
+    ("__remote-startup", po::value<uint16_t>(&tcp_listenport_remote),
       "ignore; not meant for users! (listen port of the tcp tunnel)");
     // todo: server-only, basically __remote-startup but exposed for users
   // clang-format on
@@ -337,6 +344,10 @@ int main(int argc, char *argv[]) {
   bool remote = false;
   if (vm.count("__remote-startup")) {
     remote = true;
+  } else {
+    // TODO: We can't use boost default args here, otherwise `count()` above
+    // is always true. But we should probably generate a random number here.
+    tcp_listenport_remote = 44554;
   }
   po::notify(vm);
 
@@ -365,16 +376,17 @@ int main(int argc, char *argv[]) {
 
   std::string scp_cmd = fmt::format("scp {} {}@{}:~/{}", local_filename, user,
                                     server, remote_filename);
-  // TODO: Make the server daemonize after listening socket was opened, instead
-  // of random sleep
   std::string ssh_cmd = fmt::format("ssh {}@{} -- ./{} --__remote-startup {} "
                                     "--port {} --logfile udpserver.log",
                                     user, server, remote_filename,
                                     tcp_listenport_remote, udp_listenport_remote);
 
-  debug(ssh_cmd);
+  //debug(ssh_cmd);
 
-  system(scp_cmd.c_str());
+  if (replicate) {
+    fmt::print("Uploading server binary\n");
+    system(scp_cmd.c_str());
+  }
   system(ssh_cmd.c_str());
 
   //::sleep(2); // wait for remote server startup
