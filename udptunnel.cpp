@@ -15,7 +15,7 @@
 #include <boost/program_options.hpp>
 
 #include <fmt/format.h>
-#include <fmt/printf.h>
+#include <fmt/ostream.h>
 
 #define debug(x) std::cerr << #x << ": " << x << std::endl
 
@@ -206,9 +206,8 @@ int remote_main(uint16_t forwarding_port, uint16_t udp_listenport, uint16_t tcp_
 //
 int local_main(const std::string &server, uint16_t tcp_listenport_remote,
                uint16_t udp_forwardingport_local, uint16_t udp_listenport_local) {
-  int udp_sockfd = -1;
+  int udp_sockfd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (udp_listenport_local) {
-    ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -249,6 +248,7 @@ int local_main(const std::string &server, uint16_t tcp_listenport_remote,
   fd_set wfds;
   int nfds = std::max(udp_sockfd, tcp_sockfd) + 1;
   struct sockaddr_in client;
+  client.sin_family = AF_INET;
   client.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   client.sin_port = htons(udp_forwardingport_local);
   while (true) {
@@ -276,7 +276,9 @@ int local_main(const std::string &server, uint16_t tcp_listenport_remote,
       if (n > 0) {
         int32_t n32 = n;
         ::send(tcp_sockfd, &n32, sizeof(n32), MSG_MORE);
-        ::send(tcp_sockfd, &pktbuffer[0], n, 0);
+	// TODO: actually use the framing information
+	// sent with the tcp stream
+        ::send(tcp_sockfd, &pktbuffer[4], n-4, 0);
       } else {
         break;
       }
@@ -287,9 +289,9 @@ int local_main(const std::string &server, uint16_t tcp_listenport_remote,
       int tcp_flags = 0;
       ssize_t n =
           ::recv(tcp_sockfd, &pktbuffer[0], pktbuffer.size(), tcp_flags);
-      if (n > 0) {
+      if (n > 4) {
         // todo: support more than 1 client
-        ::sendto(udp_sockfd, &pktbuffer[0], n, 0,
+        ::sendto(udp_sockfd, &pktbuffer[4], n-4, 0,
                  reinterpret_cast<struct sockaddr *>(&client), sizeof(client));
       } else {
         break;
@@ -377,9 +379,9 @@ int main(int argc, char *argv[]) {
   std::string scp_cmd = fmt::format("scp {} {}@{}:~/{}", local_filename, user,
                                     server, remote_filename);
   std::string ssh_cmd = fmt::format("ssh {}@{} -- ./{} --__remote-startup {} "
-                                    "--port {} --logfile udpserver.log",
+                                    "--port {} --external {} --logfile udpserver.log",
                                     user, server, remote_filename,
-                                    tcp_listenport_remote, udp_listenport_remote);
+                                    tcp_listenport_remote, udp_listenport_remote, accept_external_udp);
 
   //debug(ssh_cmd);
 
