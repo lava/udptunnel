@@ -14,8 +14,14 @@
 
 #include <boost/program_options.hpp>
 
+#include <fmt/core.h>
 #include <fmt/format.h>
-#include <fmt/ostream.h>
+// Raspberry Pi has an ancient version of libfmt.
+#if FMT_VERSION < 60102
+#  include <fmt/ostream.h>
+#else
+#  include <fmt/printf.h>
+#endif
 
 #define debug(x) std::cerr << #x << ": " << x << std::endl
 
@@ -242,7 +248,8 @@ int local_main(const std::string &server, uint16_t tcp_listenport_remote,
 
   std::fflush(stdout);
 
-  std::vector<char> pktbuffer(8 * 1024 * 1024);
+  std::vector<char> out_pktbuffer(8 * 1024 * 1024);
+  bev::linear_ringbuffer tcp_to_udp;
 
   fd_set rfds;
   fd_set wfds;
@@ -271,14 +278,12 @@ int local_main(const std::string &server, uint16_t tcp_listenport_remote,
     if (FD_ISSET(udp_sockfd, &rfds)) {
       fmt::printf("received udp msg from localhost\n");
       ssize_t n =
-          ::recvfrom(udp_sockfd, &pktbuffer[0], pktbuffer.size(), flags,
+          ::recvfrom(udp_sockfd, &out_pktbuffer[0], out_pktbuffer.size(), flags,
                      reinterpret_cast<struct sockaddr *>(&client), &client_len);
       if (n > 0) {
         int32_t n32 = n;
         ::send(tcp_sockfd, &n32, sizeof(n32), MSG_MORE);
-	// TODO: actually use the framing information
-	// sent with the tcp stream
-        ::send(tcp_sockfd, &pktbuffer[4], n-4, 0);
+        ::send(tcp_sockfd, &out_pktbuffer[0], n, 0);
       } else {
         break;
       }
@@ -288,11 +293,18 @@ int local_main(const std::string &server, uint16_t tcp_listenport_remote,
       fmt::printf("received tcp msg from remote\n");
       int tcp_flags = 0;
       ssize_t n =
-          ::recv(tcp_sockfd, &pktbuffer[0], pktbuffer.size(), tcp_flags);
-      if (n > 4) {
-        // todo: support more than 1 client
-        ::sendto(udp_sockfd, &pktbuffer[4], n-4, 0,
-                 reinterpret_cast<struct sockaddr *>(&client), sizeof(client));
+          ::recv(tcp_sockfd, tcp_to_udp.read_head(), tcp_to_udp.free_size(), tcp_flags);
+      if (tcp_to_udp.size() >= 4) {
+        uint32_t pktsize =
+            *reinterpret_cast<uint32_t *>(tcp_to_udp.read_head());
+        assert(tcp_to_udp.size() >= 4 + pktsize);
+        ssize_t n = ::sendto(udp_sockfd, tcp_to_udp.read_head() + 4, pktsize, 0,
+                             reinterpret_cast<struct sockaddr *>(&client),
+                             sizeof(client));
+        if (n > 0) {
+          // always clear the full packet, even if n < pktsize for some reason
+          tcp_to_udp.consume(4 + pktsize);
+        }
       } else {
         break;
       }
